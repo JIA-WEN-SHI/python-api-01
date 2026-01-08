@@ -1,4 +1,5 @@
 fastapi
-uvicorn
-akshare
+uvicorn[standard]
 pandas
+tushare
+akshare
