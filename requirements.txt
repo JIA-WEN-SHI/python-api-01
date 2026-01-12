@@ -1,5 +1,9 @@
 fastapi
-uvicorn[standard]
+uvicorn
+pydantic
 pandas
 tushare
 akshare
+supabase
+numpy
+python-dotenv
