@@ -1,14 +1,9 @@
-# 强烈建议 Python = 3.10
 fastapi==0.110.0
-uvicorn[standard]==0.29.0
+uvicorn[standard]==0.27.1
+pydantic==2.6.4
 
-# 科学计算（稳定轮子）
-numpy==1.26.4
-pandas==1.5.3
+pandas==2.1.4
+tushare==1.2.89
+akshare==1.13.92
 
-# 数据源
-tushare==1.4.14
-akshare==1.11.22
-
-# 其他
-requests
+requests==2.31.0
