@@ -1,23 +1,18 @@
-# app/main.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Optional, Dict, Any, List
-import os
-import time
-import hashlib
-import pandas as pd
-import traceback
+from typing import Dict, Any, List
+import os, time, hashlib, traceback
 
+import pandas as pd
 import tushare as ts
 import akshare as ak
 
-app = FastAPI(title="Stock Data Proxy", version="1.3.0")
+app = FastAPI(title="Stock Data Proxy", version="1.4.0")
 
 # =========================================================
-# Env
+# ENV
 # =========================================================
 TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
-
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "120"))
 
@@ -75,17 +70,14 @@ def to_6digit(ticker: str) -> str:
 class FundamentalsReq(BaseModel):
     ticker: str
     years: int = 5
-    provider: str = "tushare"
 
 class ValuationReq(BaseModel):
     ticker: str
     years: int = 10
-    provider: str = "tushare"
 
 class NewsReq(BaseModel):
     ticker: str
     limit: int = 10
-    provider: str = "em"
 
 # =========================================================
 # TuShare
@@ -101,51 +93,37 @@ def fundamentals_tushare(ticker: str, years: int):
         pro = tushare_client()
         ts_code = to_ts_code(ticker)
         now_year = pd.Timestamp.utcnow().year
-        periods = [f"{y}1231" for y in range(now_year - years, now_year)]
 
-        for p in periods:
+        for y in range(now_year - years, now_year):
+            period = f"{y}1231"
             try:
                 df = pro.income(
                     ts_code=ts_code,
-                    period=p,
+                    period=period,
                     fields="end_date,total_revenue,n_income_attr_p"
                 )
                 if df is None or df.empty:
                     continue
-
                 r = df.iloc[0]
                 items.append({
-                    "period": str(r["end_date"])[:4] + "A",
+                    "period": f"{y}A",
                     "revenue": float(r.get("total_revenue") or 0),
                     "net_profit": float(r.get("n_income_attr_p") or 0),
-                    "cfo": None,
-                    "roe": None,
-                    "gross_margin": None,
-                    "net_margin": None,
                 })
             except Exception:
                 continue
-
     except Exception as e:
-        return {
-            "items": [],
-            "error": str(e),
-            "source": {"source_id": "src_tushare_fin"}
-        }
+        return {"items": [], "error": str(e)}
 
     return {
         "items": items,
-        "source": {
-            "source_id": "src_tushare_fin",
-            "title": "TuShare Pro"
-        }
+        "source": {"source_id": "src_tushare_fin"}
     }
 
 def valuation_tushare(ticker: str, years: int):
     try:
         pro = tushare_client()
         ts_code = to_ts_code(ticker)
-
         end = pd.Timestamp.utcnow().strftime("%Y%m%d")
         start = (pd.Timestamp.utcnow() - pd.DateOffset(years=years)).strftime("%Y%m%d")
 
@@ -156,77 +134,57 @@ def valuation_tushare(ticker: str, years: int):
             fields="trade_date,pe,pb,ps"
         )
         if df is None or df.empty:
-            return {"current": {}, "percentile": {}, "source": {"source_id": "src_tushare_mkt"}}
+            return {"current": {}, "percentile": {}}
 
         df = df.sort_values("trade_date")
         cur = df.iloc[-1]
 
         def pct(series, v):
             s = series.dropna().astype(float)
-            if s.empty or v is None:
-                return None
-            return float((s < v).mean())
-
-        pe = float(cur["pe"]) if pd.notna(cur["pe"]) else None
-        pb = float(cur["pb"]) if pd.notna(cur["pb"]) else None
-        ps = float(cur["ps"]) if pd.notna(cur["ps"]) else None
+            return float((s < v).mean()) if not s.empty and v is not None else None
 
         return {
-            "current": {"pe": pe, "pb": pb, "ps": ps},
+            "current": {
+                "pe": float(cur["pe"]) if pd.notna(cur["pe"]) else None,
+                "pb": float(cur["pb"]) if pd.notna(cur["pb"]) else None,
+                "ps": float(cur["ps"]) if pd.notna(cur["ps"]) else None,
+            },
             "percentile": {
-                "pe_10y": pct(df["pe"], pe),
-                "pb_10y": pct(df["pb"], pb),
-                "ps_10y": pct(df["ps"], ps),
+                "pe_10y": pct(df["pe"], cur["pe"]),
+                "pb_10y": pct(df["pb"], cur["pb"]),
+                "ps_10y": pct(df["ps"], cur["ps"]),
             },
             "source": {"source_id": "src_tushare_mkt"}
         }
     except Exception as e:
         traceback.print_exc()
-        return {
-            "current": {},
-            "percentile": {},
-            "error": str(e),
-            "source": {"source_id": "src_tushare_mkt"}
-        }
+        return {"current": {}, "percentile": {}, "error": str(e)}
 
 # =========================================================
-# News – AKShare 东方财富
+# News – 东方财富（AKShare）
 # =========================================================
 def news_em(ticker: str, limit: int):
-    code = to_6digit(ticker)
     items = []
     try:
-        df = ak.stock_news_em(symbol=code).head(limit)
+        df = ak.stock_news_em(symbol=to_6digit(ticker)).head(limit)
         for _, r in df.iterrows():
             items.append({
                 "title": str(r.get("新闻标题", "")),
                 "url": str(r.get("新闻链接", "")),
                 "published_at": str(r.get("发布时间", "")),
-                "snippet": str(r.get("新闻内容", ""))[:180]
             })
     except Exception as e:
-        return {
-            "items": [],
-            "error": str(e),
-            "source": {"source_id": "src_em_news"}
-        }
+        return {"items": [], "error": str(e)}
 
-    return {
-        "items": items,
-        "source": {"source_id": "src_em_news"}
-    }
+    return {"items": items, "source": {"source_id": "src_em_news"}}
 
 # =========================================================
 # API
 # =========================================================
 @app.post("/finance/fundamentals")
 def fundamentals(req: FundamentalsReq):
-    if req.provider.lower() != "tushare":
-        raise HTTPException(400, "Only tushare supported (free tier)")
-
     ck = _cache_key("/finance/fundamentals", req.dict())
-    cached = cache_get(ck)
-    if cached:
+    if (cached := cache_get(ck)):
         return cached
 
     rate_limit("tushare:fundamentals")
@@ -236,12 +194,8 @@ def fundamentals(req: FundamentalsReq):
 
 @app.post("/market/valuation")
 def valuation(req: ValuationReq):
-    if req.provider.lower() != "tushare":
-        raise HTTPException(400, "Only tushare supported (free tier)")
-
     ck = _cache_key("/market/valuation", req.dict())
-    cached = cache_get(ck)
-    if cached:
+    if (cached := cache_get(ck)):
         return cached
 
     rate_limit("tushare:valuation")
@@ -251,12 +205,8 @@ def valuation(req: ValuationReq):
 
 @app.post("/news/search")
 def news(req: NewsReq):
-    if req.provider.lower() != "em":
-        raise HTTPException(400, "Only em supported")
-
     ck = _cache_key("/news/search", req.dict())
-    cached = cache_get(ck)
-    if cached:
+    if (cached := cache_get(ck)):
         return cached
 
     rate_limit("em:news")
@@ -266,7 +216,4 @@ def news(req: NewsReq):
 
 @app.get("/health")
 def health():
-    return {
-        "ok": True,
-        "cache_size": len(_CACHE)
-    }
+    return {"ok": True, "cache": len(_CACHE)}
