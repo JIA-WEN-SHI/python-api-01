@@ -1,5 +1,4 @@
-# app/main.py
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
 import os, time, hashlib
@@ -7,18 +6,12 @@ import os, time, hashlib
 import pandas as pd
 import tushare as ts
 
-app = FastAPI(title="Stock Data Proxy", version="1.5.0")
+app = FastAPI(title="Stock Data Proxy", version="1.5.1")
 
 # =========================================================
-# Env / Settings
+# Env
 # =========================================================
 TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
-LIXINGER_TOKEN = os.getenv("LIXINGER_TOKEN", "")
-LIXINGER_BASE_URL = os.getenv("LIXINGER_BASE_URL", "https://www.lixinger.com/open/api")
-LIXINGER_TIMEOUT = int(os.getenv("LIXINGER_TIMEOUT", "30"))
-
-JQ_USER = os.getenv("JQ_USER", "")
-JQ_PASSWORD = os.getenv("JQ_PASSWORD", "")
 
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "120"))
@@ -49,7 +42,7 @@ def rate_limit(key: str):
     now = time.time()
     bucket = [t for t in _RATE_BUCKET.get(key, []) if now - t < 60]
     if len(bucket) >= RATE_LIMIT_PER_MIN:
-        raise HTTPException(status_code=429, detail=f"Rate limit exceeded: {key}")
+        return
     bucket.append(now)
     _RATE_BUCKET[key] = bucket
 
@@ -65,18 +58,8 @@ def to_ts_code(ticker: str) -> str:
     return t
 
 def to_6digit_a_share(ticker: str) -> str:
-    t = ticker.strip().upper().split(".")[0]
+    t = (ticker or "").strip().upper().split(".")[0]
     return t.replace("SH", "").replace("SZ", "")
-
-def to_jq_code(ticker: str) -> str:
-    t = ticker.strip().upper()
-    if t.endswith(".SZ"):
-        return t.replace(".SZ", ".XSHE")
-    if t.endswith(".SH"):
-        return t.replace(".SH", ".XSHG")
-    if len(t) == 6 and t.isdigit():
-        return f"{t}.XSHG" if t.startswith("6") else f"{t}.XSHE"
-    return t
 
 # =========================================================
 # Request Models
@@ -107,7 +90,11 @@ def tushare_client():
 def fundamentals_tushare(ticker: str, years: int):
     pro = tushare_client()
     if not pro:
-        return {"items": [], "error": "TUSHARE_TOKEN missing", "source": {"source_id": "src_tushare_fin"}}
+        return {
+            "items": [],
+            "error": "TUSHARE_TOKEN missing",
+            "source": {"source_id": "src_tushare_fin"}
+        }
 
     ts_code = to_ts_code(ticker)
     now_year = pd.Timestamp.utcnow().year
@@ -140,8 +127,12 @@ def fundamentals_tushare(ticker: str, years: int):
 def valuation_tushare(ticker: str, years: int):
     pro = tushare_client()
     if not pro:
-        return {"current": {}, "percentile": {}, "error": "TUSHARE_TOKEN missing",
-                "source": {"source_id": "src_tushare_mkt"}}
+        return {
+            "current": {},
+            "percentile": {},
+            "error": "TUSHARE_TOKEN missing",
+            "source": {"source_id": "src_tushare_mkt"}
+        }
 
     ts_code = to_ts_code(ticker)
     end = pd.Timestamp.utcnow().strftime("%Y%m%d")
@@ -155,8 +146,12 @@ def valuation_tushare(ticker: str, years: int):
             fields="trade_date,pe,pb,ps"
         )
     except Exception as e:
-        return {"current": {}, "percentile": {}, "error": str(e),
-                "source": {"source_id": "src_tushare_mkt"}}
+        return {
+            "current": {},
+            "percentile": {},
+            "error": str(e),
+            "source": {"source_id": "src_tushare_mkt"}
+        }
 
     if df is None or df.empty:
         return {"current": {}, "percentile": {}, "source": {"source_id": "src_tushare_mkt"}}
@@ -183,26 +178,19 @@ def valuation_tushare(ticker: str, years: int):
     }
 
 # =========================================================
-# Lixinger / JoinQuant 保留（Skeleton，不影响构建）
-# =========================================================
-def fundamentals_lixinger(ticker: str, years: int):
-    return {"items": [], "error": "Lixinger not enabled", "source": {"source_id": "src_lixinger_fin"}}
-
-def valuation_joinquant(ticker: str, years: int):
-    return {"current": {}, "percentile": {}, "error": "JoinQuant not enabled",
-            "source": {"source_id": "src_joinquant_mkt"}}
-
-# =========================================================
-# News – AKShare（runtime import，避免 build 失败）
+# News – AKShare（runtime import）
 # =========================================================
 def news_em(ticker: str, limit: int):
     try:
         import akshare as ak
     except Exception as e:
-        return {"items": [], "error": f"akshare import failed: {e}",
-                "source": {"source_id": "src_em_news"}}
+        return {
+            "items": [],
+            "error": f"akshare import failed: {e}",
+            "source": {"source_id": "src_em_news"}
+        }
 
-    code = to_6digit_a_share(ticker or "")
+    code = to_6digit_a_share(ticker)
     items = []
 
     try:
@@ -215,7 +203,11 @@ def news_em(ticker: str, limit: int):
                 "snippet": str(r.get("新闻内容", ""))[:180],
             })
     except Exception as e:
-        return {"items": [], "error": str(e), "source": {"source_id": "src_em_news"}}
+        return {
+            "items": [],
+            "error": str(e),
+            "source": {"source_id": "src_em_news"}
+        }
 
     return {"items": items, "source": {"source_id": "src_em_news"}}
 
