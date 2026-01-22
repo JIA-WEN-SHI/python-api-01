@@ -1,252 +1,165 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import Optional, Dict, Any, List
-import os, time, hashlib
+# app/main.py
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from typing import List, Literal, Optional, Dict, Any
+from datetime import datetime, date
+import hashlib, json, os
 
-import pandas as pd
-import tushare as ts
+CollectorName = Literal["financials","valuation","filings","news","peers"]
 
-app = FastAPI(title="Stock Data Proxy", version="1.5.1")
-
-# =========================================================
-# Env
-# =========================================================
-TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "")
-
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
-RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "120"))
-
-_CACHE: Dict[str, Dict[str, Any]] = {}
-_RATE_BUCKET: Dict[str, List[float]] = {}
-
-# =========================================================
-# Cache / Rate limit
-# =========================================================
-def _cache_key(path: str, payload: Dict[str, Any]) -> str:
-    raw = path + "::" + str(sorted(payload.items()))
-    return hashlib.md5(raw.encode("utf-8")).hexdigest()
-
-def cache_get(key: str):
-    v = _CACHE.get(key)
-    if not v:
-        return None
-    if time.time() - v["ts"] > CACHE_TTL_SECONDS:
-        _CACHE.pop(key, None)
-        return None
-    return v["data"]
-
-def cache_set(key: str, data: Any):
-    _CACHE[key] = {"ts": time.time(), "data": data}
-
-def rate_limit(key: str):
-    now = time.time()
-    bucket = [t for t in _RATE_BUCKET.get(key, []) if now - t < 60]
-    if len(bucket) >= RATE_LIMIT_PER_MIN:
-        return
-    bucket.append(now)
-    _RATE_BUCKET[key] = bucket
-
-# =========================================================
-# Ticker helpers
-# =========================================================
-def to_ts_code(ticker: str) -> str:
-    t = ticker.strip().upper()
-    if t.endswith(".SH") or t.endswith(".SZ"):
-        return t
-    if len(t) == 6 and t.isdigit():
-        return f"{t}.SH" if t.startswith("6") else f"{t}.SZ"
-    return t
-
-def to_6digit_a_share(ticker: str) -> str:
-    t = (ticker or "").strip().upper().split(".")[0]
-    return t.replace("SH", "").replace("SZ", "")
-
-# =========================================================
-# Request Models
-# =========================================================
-class FundamentalsReq(BaseModel):
+class RunContext(BaseModel):
+    run_id: str
     ticker: str
-    years: int = 5
-    provider: str = "tushare"
+    name: Optional[str] = None
+    asof: Optional[date] = None
 
-class ValuationReq(BaseModel):
+class CollectRequest(BaseModel):
+    run_context: RunContext
+    collectors: List[CollectorName] = Field(default_factory=lambda: ["financials","valuation","filings","news","peers"])
+
+class Source(BaseModel):
+    source_id: str
+    run_id: str
+    type: str
+    title: str
+    url: str
+    published_at: Optional[date] = None
+    quote: Optional[str] = None
+    retrieved_at: datetime
+    content_hash: str
+    raw: Optional[Dict[str, Any]] = None
+
+class Fact(BaseModel):
+    run_id: str
+    entity_kind: str = "company"
+    entity_ticker: Optional[str] = None
+    entity_name: Optional[str] = None
+    metric: str
+    value: float
+    period: str
+    unit: Optional[str] = None
+    currency: Optional[str] = None
+    basis: Optional[str] = None
+    asof_date: Optional[date] = None
+    source_id: str
+
+class Peer(BaseModel):
+    peer_ticker: str
+    peer_name: Optional[str] = None
+
+class EvidencePack(BaseModel):
+    run_id: str
     ticker: str
-    years: int = 10
-    provider: str = "tushare"
+    asof: Optional[date] = None
+    sources: List[Source] = []
+    facts: List[Fact] = []
+    peers: List[Peer] = []
+    warnings: List[str] = []
 
-class NewsReq(BaseModel):
-    ticker: Optional[str] = None
-    limit: int = 10
-    provider: str = "em"
+app = FastAPI(title="Collector Service", version="0.1.0")
 
-# =========================================================
-# TuShare
-# =========================================================
-def tushare_client():
-    if not TUSHARE_TOKEN:
-        return None
-    return ts.pro_api(TUSHARE_TOKEN)
+def sha256_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-def fundamentals_tushare(ticker: str, years: int):
-    pro = tushare_client()
-    if not pro:
-        return {
-            "items": [],
-            "error": "TUSHARE_TOKEN missing",
-            "source": {"source_id": "src_tushare_fin"}
-        }
+def make_source_id(run_id: str, provider: str, stype: str, url: str, extra: Dict[str, Any]) -> str:
+    h = sha256_text(url + "|" + json.dumps(extra, ensure_ascii=False, sort_keys=True))
+    return f"src_{provider}_{stype}__{run_id}__{h[:16]}"
 
-    ts_code = to_ts_code(ticker)
-    now_year = pd.Timestamp.utcnow().year
-    items = []
+# ---- 下面这些先写成“占位”，你后面逐步补真实抓取 ----
+async def collect_financials(ctx: RunContext) -> EvidencePack:
+    pack = EvidencePack(run_id=ctx.run_id, ticker=ctx.ticker, asof=ctx.asof)
+    # TODO: 接入 tushare / lixinger / jq / 自有API
+    # 这里演示一条“可追溯”的 source + facts
+    url = f"https://example.com/financials/{ctx.ticker}"
+    raw = {"provider":"demo","kind":"financials","ticker":ctx.ticker}
+    sid = make_source_id(ctx.run_id, "demo", "financials", url, raw)
+    now = datetime.utcnow()
+    pack.sources.append(Source(
+        source_id=sid, run_id=ctx.run_id, type="annual_report",
+        title=f"{ctx.ticker} 财务数据（示例）", url=url,
+        published_at=None, quote="示例：该链接用于占位，后续替换为真实来源。",
+        retrieved_at=now, content_hash=sha256_text(json.dumps(raw, ensure_ascii=False)),
+        raw=raw
+    ))
+    pack.facts.append(Fact(
+        run_id=ctx.run_id, entity_kind="company", entity_ticker=ctx.ticker, entity_name=ctx.name,
+        metric="revenue", value=1.0, period="2023A", unit="CNY", currency="CNY",
+        basis="consolidated", asof_date=date(2023,12,31), source_id=sid
+    ))
+    return pack
 
-    for y in range(now_year - years, now_year):
-        try:
-            df = pro.income(
-                ts_code=ts_code,
-                period=f"{y}1231",
-                fields="end_date,total_revenue,n_income_attr_p"
-            )
-            if df is None or df.empty:
+async def collect_valuation(ctx: RunContext) -> EvidencePack:
+    pack = EvidencePack(run_id=ctx.run_id, ticker=ctx.ticker, asof=ctx.asof)
+    # TODO: PE/PB/PS 当前 + 历史序列
+    return pack
+
+async def collect_filings(ctx: RunContext) -> EvidencePack:
+    pack = EvidencePack(run_id=ctx.run_id, ticker=ctx.ticker, asof=ctx.asof)
+    # TODO: 年报/公告抓取：只需要抽“可引用片段 quote”，不要整篇塞进 sources.quote
+    return pack
+
+async def collect_news(ctx: RunContext) -> EvidencePack:
+    pack = EvidencePack(run_id=ctx.run_id, ticker=ctx.ticker, asof=ctx.asof)
+    # TODO: 新闻/RSS/研报摘要：每条一条 source（source_id 唯一）
+    return pack
+
+async def collect_peers(ctx: RunContext) -> EvidencePack:
+    pack = EvidencePack(run_id=ctx.run_id, ticker=ctx.ticker, asof=ctx.asof)
+    # TODO: 先用静态映射/规则：行业=白酒 -> peers
+    pack.peers = []
+    return pack
+
+COLLECTOR_MAP = {
+    "financials": collect_financials,
+    "valuation": collect_valuation,
+    "filings": collect_filings,
+    "news": collect_news,
+    "peers": collect_peers,
+}
+
+def merge_packs(packs: List[EvidencePack]) -> EvidencePack:
+    out = packs[0]
+    seen_source = set()
+    # 合并 sources 去重
+    merged_sources = []
+    for p in packs:
+        for s in p.sources:
+            if s.source_id in seen_source: 
                 continue
-            r = df.iloc[0]
-            items.append({
-                "period": f"{y}A",
-                "revenue": float(r.get("total_revenue") or 0),
-                "net_profit": float(r.get("n_income_attr_p") or 0),
-                "cfo": None,
-                "roe": None,
-                "gross_margin": None,
-                "net_margin": None,
-            })
-        except Exception:
-            continue
-
-    return {"items": items, "source": {"source_id": "src_tushare_fin"}}
-
-def valuation_tushare(ticker: str, years: int):
-    pro = tushare_client()
-    if not pro:
-        return {
-            "current": {},
-            "percentile": {},
-            "error": "TUSHARE_TOKEN missing",
-            "source": {"source_id": "src_tushare_mkt"}
-        }
-
-    ts_code = to_ts_code(ticker)
-    end = pd.Timestamp.utcnow().strftime("%Y%m%d")
-    start = (pd.Timestamp.utcnow() - pd.DateOffset(years=years)).strftime("%Y%m%d")
-
-    try:
-        df = pro.daily_basic(
-            ts_code=ts_code,
-            start_date=start,
-            end_date=end,
-            fields="trade_date,pe,pb,ps"
-        )
-    except Exception as e:
-        return {
-            "current": {},
-            "percentile": {},
-            "error": str(e),
-            "source": {"source_id": "src_tushare_mkt"}
-        }
-
-    if df is None or df.empty:
-        return {"current": {}, "percentile": {}, "source": {"source_id": "src_tushare_mkt"}}
-
-    df = df.sort_values("trade_date")
-    cur = df.iloc[-1]
-
-    def pct(series, v):
-        s = series.dropna().astype(float)
-        return float((s < v).mean()) if not s.empty and v is not None else None
-
-    return {
-        "current": {
-            "pe": float(cur["pe"]) if pd.notna(cur["pe"]) else None,
-            "pb": float(cur["pb"]) if pd.notna(cur["pb"]) else None,
-            "ps": float(cur["ps"]) if pd.notna(cur["ps"]) else None,
-        },
-        "percentile": {
-            "pe_10y": pct(df["pe"], cur["pe"]),
-            "pb_10y": pct(df["pb"], cur["pb"]),
-            "ps_10y": pct(df["ps"], cur["ps"]),
-        },
-        "source": {"source_id": "src_tushare_mkt"}
-    }
-
-# =========================================================
-# News – AKShare（runtime import）
-# =========================================================
-def news_em(ticker: str, limit: int):
-    try:
-        import akshare as ak
-    except Exception as e:
-        return {
-            "items": [],
-            "error": f"akshare import failed: {e}",
-            "source": {"source_id": "src_em_news"}
-        }
-
-    code = to_6digit_a_share(ticker)
-    items = []
-
-    try:
-        df = ak.stock_news_em(symbol=code).head(limit)
-        for _, r in df.iterrows():
-            items.append({
-                "title": str(r.get("新闻标题", "")),
-                "url": str(r.get("新闻链接", "")),
-                "published_at": str(r.get("发布时间", "")),
-                "snippet": str(r.get("新闻内容", ""))[:180],
-            })
-    except Exception as e:
-        return {
-            "items": [],
-            "error": str(e),
-            "source": {"source_id": "src_em_news"}
-        }
-
-    return {"items": items, "source": {"source_id": "src_em_news"}}
-
-# =========================================================
-# API
-# =========================================================
-@app.post("/finance/fundamentals")
-def fundamentals(req: FundamentalsReq):
-    ck = _cache_key("/finance/fundamentals", req.dict())
-    if (v := cache_get(ck)) is not None:
-        return v
-
-    rate_limit("tushare:fundamentals")
-    out = fundamentals_tushare(req.ticker, req.years)
-    cache_set(ck, out)
+            seen_source.add(s.source_id)
+            merged_sources.append(s)
+    out.sources = merged_sources
+    # 合并 facts（你也可以按 (metric,period,entity) 去重）
+    out.facts = [f for p in packs for f in p.facts]
+    # 合并 peers 去重
+    seen_peer = set()
+    peers = []
+    for p in packs:
+        for pe in p.peers:
+            if pe.peer_ticker in seen_peer: 
+                continue
+            seen_peer.add(pe.peer_ticker)
+            peers.append(pe)
+    out.peers = peers
+    out.warnings = [w for p in packs for w in p.warnings]
     return out
 
-@app.post("/market/valuation")
-def valuation(req: ValuationReq):
-    ck = _cache_key("/market/valuation", req.dict())
-    if (v := cache_get(ck)) is not None:
-        return v
+@app.post("/collect/evidence-pack", response_model=EvidencePack)
+async def collect_evidence(req: CollectRequest):
+    ctx = req.run_context
+    packs = []
+    for c in req.collectors:
+        fn = COLLECTOR_MAP.get(c)
+        if not fn:
+            raise HTTPException(status_code=400, detail=f"Unknown collector: {c}")
+        packs.append(await fn(ctx))
+    if not packs:
+        return EvidencePack(run_id=ctx.run_id, ticker=ctx.ticker, asof=ctx.asof)
+    out = merge_packs(packs)
 
-    rate_limit("tushare:valuation")
-    out = valuation_tushare(req.ticker, req.years)
-    cache_set(ck, out)
+    # 真实性护栏：facts 的 source_id 必须在 sources 里
+    source_ids = {s.source_id for s in out.sources}
+    bad = [f for f in out.facts if f.source_id not in source_ids]
+    if bad:
+        out.warnings.append(f"{len(bad)} facts 缺失 source_id 对应 sources，建议 n8n 拒绝入库。")
     return out
-
-@app.post("/news/search")
-def news(req: NewsReq):
-    ck = _cache_key("/news/search", req.dict())
-    if (v := cache_get(ck)) is not None:
-        return v
-
-    rate_limit("em:news")
-    out = news_em(req.ticker, req.limit)
-    cache_set(ck, out)
-    return out
-
-@app.get("/health")
-def health():
-    return {"ok": True, "cache_size": len(_CACHE)}
