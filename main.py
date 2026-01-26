@@ -1,23 +1,24 @@
 # app/main.py
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from pydantic import field_validator
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Literal, Optional, Dict, Any
 from datetime import datetime, date
-import hashlib, json, os, requests
+import hashlib, json, os
 
-# -------------------------
+import httpx  # ✅ 用 httpx 避免 async 里 requests 阻塞
+
+# =========================================================
 # Config
-# -------------------------
+# =========================================================
 TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "").strip()
-LIXINGER_TOKEN = os.getenv("LIXINGER_TOKEN", "").strip()
-# 你可以继续加：CNINFO_KEY / RSS_LIST / GDELT 等
+LIXINGER_TOKEN = os.getenv("LIXINGER_TOKEN", "").strip()  # 预留
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30"))
 
 CollectorName = Literal["financials", "valuation", "filings", "news", "peers"]
 
-# -------------------------
+# =========================================================
 # Helpers
-# -------------------------
+# =========================================================
 def md5_text(s: str) -> str:
     return hashlib.md5(s.encode("utf-8")).hexdigest()
 
@@ -27,20 +28,62 @@ def sha256_text(s: str) -> str:
 def safe_json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str)
 
+def normalize_ts_code(ticker: str) -> str:
+    """
+    支持传入：
+    - 600519
+    - 600519.SH
+    - 000001 / 300xxx
+    - 北交所 8xxxx / 4xxxx -> .BJ
+    """
+    t = (ticker or "").strip().upper()
+    if not t:
+        return t
+    if "." in t:
+        return t
+    if t.startswith("6"):
+        return f"{t}.SH"
+    if t.startswith(("0", "3")):
+        return f"{t}.SZ"
+    if t.startswith(("8", "4")):
+        return f"{t}.BJ"
+    return t  # 兜底
+
 def make_source_id(run_id: str, provider: str, stype: str, url_hash: str) -> str:
-    # 让 source_id 可复现（同 run_id+url_hash 一定同一个）
+    # ✅可复现：同 run_id + stype + url_hash => 同一个 source_id
     return f"src_{provider}_{stype}__{run_id}__{url_hash[:16]}"
 
-# -------------------------
+async def tushare_post(api_name: str, params: Dict[str, Any], fields: str = "") -> Dict[str, Any]:
+    """
+    Tushare：POST https://api.tushare.pro
+    返回：{"code":0,"msg":"","data":{"fields":[...],"items":[...]}}
+    """
+    if not TUSHARE_TOKEN:
+        return {"code": -1, "msg": "TUSHARE_TOKEN missing", "data": None}
+
+    payload: Dict[str, Any] = {
+        "api_name": api_name,
+        "token": TUSHARE_TOKEN,
+        "params": params,
+    }
+    if fields:
+        payload["fields"] = fields
+
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        r = await client.post("https://api.tushare.pro", json=payload)
+        r.raise_for_status()
+        return r.json()
+
+# =========================================================
 # Models (align DB)
-# -------------------------
+# =========================================================
 class RunContext(BaseModel):
     run_id: str
     ticker: str
     name: Optional[str] = None
     asof: Optional[date] = None
 
-    # 解决 n8n 传空字符串导致 422
+    # ✅解决 n8n 传空字符串导致 422
     @field_validator("asof", mode="before")
     @classmethod
     def empty_str_to_none(cls, v):
@@ -55,10 +98,10 @@ class CollectRequest(BaseModel):
     )
 
 class SourceRow(BaseModel):
-    # 对齐 sources 表字段
+    # sources 表字段（你库里 url_hash 是 generated，但这里返回给 n8n 方便写库/校验）
     source_id: str
     run_id: str
-    type: str
+    type: str  # ✅统一用：annual_report / announcement / news / policy / industry_report / research_report / market_data / valuation_data ...
     title: Optional[str] = None
     url: str
     url_hash: str
@@ -69,7 +112,7 @@ class SourceRow(BaseModel):
     raw: Optional[Dict[str, Any]] = None
 
 class FactRow(BaseModel):
-    # 对齐 normalized_facts 表字段
+    # normalized_facts 表字段
     run_id: str
     entity_kind: str = "company"  # company|peer|industry|macro
     entity_ticker: Optional[str] = None
@@ -77,11 +120,11 @@ class FactRow(BaseModel):
 
     metric: str
     value: float
-    period: str
+    period: str  # FY2023 / 2024Q1 / TTM / current
 
-    unit: Optional[str] = None
-    currency: Optional[str] = None
-    basis: Optional[str] = None
+    unit: Optional[str] = None       # cny / pct / times / shares / ...
+    currency: Optional[str] = None   # CNY / USD / ...
+    basis: Optional[str] = None      # consolidated / parent / ...
     asof_date: Optional[date] = None
 
     source_id: str
@@ -94,46 +137,38 @@ class EvidencePack(BaseModel):
     run_id: str
     ticker: str
     asof: Optional[date] = None
-    sources: List[SourceRow] = []
-    facts: List[FactRow] = []
-    peers: List[PeerRow] = []
-    warnings: List[str] = []
+    sources: List[SourceRow] = Field(default_factory=list)
+    facts: List[FactRow] = Field(default_factory=list)
+    peers: List[PeerRow] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
 
-app = FastAPI(title="Collector Service", version="0.2.0")
+# =========================================================
+# App
+# =========================================================
+app = FastAPI(title="Collector Service", version="0.3.0")
 
-# -------------------------
-# Providers (skeleton)
-# -------------------------
+@app.get("/health")
+async def health():
+    return {"ok": True, "ts": datetime.utcnow().isoformat()}
 
-def tushare_post(api_name: str, params: Dict[str, Any], fields: str = "") -> Dict[str, Any]:
-    """
-    Tushare 官方接口是 POST 到 api.tushare.pro
-    返回 JSON：code/msg/data
-    """
-    url = "https://api.tushare.pro"
-    payload = {
-        "api_name": api_name,
-        "token": TUSHARE_TOKEN,
-        "params": params,
-    }
-    if fields:
-        payload["fields"] = fields
-    r = requests.post(url, json=payload, timeout=30)
-    r.raise_for_status()
-    return r.json()
-
-def build_source(run_id: str, stype: str, provider: str, url: str,
-                 title: str, raw: Dict[str, Any],
-                 published_at: Optional[date] = None,
-                 quote: Optional[str] = None) -> SourceRow:
+def build_source(
+    run_id: str,
+    source_type: str,   # ✅用 sources.type 的语义（market_data / valuation_data / news / annual_report...）
+    provider: str,
+    url: str,
+    title: str,
+    raw: Dict[str, Any],
+    published_at: Optional[date] = None,
+    quote: Optional[str] = None,
+) -> SourceRow:
     url_hash = md5_text(url)
-    source_id = make_source_id(run_id, provider, stype, url_hash)
+    source_id = make_source_id(run_id, provider, source_type, url_hash)
     retrieved_at = datetime.utcnow()
     content_hash = sha256_text(safe_json(raw))
     return SourceRow(
         source_id=source_id,
         run_id=run_id,
-        type=stype,
+        type=source_type,
         title=title,
         url=url,
         url_hash=url_hash,
@@ -144,13 +179,14 @@ def build_source(run_id: str, stype: str, provider: str, url: str,
         raw=raw,
     )
 
-# -------------------------
+# =========================================================
 # Collectors
-# -------------------------
-
+# =========================================================
 async def collect_financials(ctx: RunContext) -> EvidencePack:
     """
-    目标：三表 + 财务指标（最小集即可），全部写 facts，并且 source 可追溯。
+    ✅最小闭环：Tushare income 三年（FY）+ 可审计 raw
+    - sources.type = market_data（统一给 Phase6/Phase3 使用）
+    - facts.period = FY2021 / FY2022 / FY2023（统一）
     """
     pack = EvidencePack(run_id=ctx.run_id, ticker=ctx.ticker, asof=ctx.asof)
 
@@ -158,50 +194,64 @@ async def collect_financials(ctx: RunContext) -> EvidencePack:
         pack.warnings.append("TUSHARE_TOKEN 未配置：financials 未抓取任何数据。")
         return pack
 
-    # 这里用“tushare 返回 raw + 指标 facts”的思路：
-    # 你可以从 3-5 年开始（例如 2020-2024），逐步扩展季度/TTM
+    ts_code = normalize_ts_code(ctx.ticker)
+    if "." not in ts_code:
+        pack.warnings.append(f"ticker 无法规范化为 ts_code：{ctx.ticker}")
+        return pack
+
     years = [2021, 2022, 2023]  # MVP：先 3 年
+    income_raw_all: List[Dict[str, Any]] = []
 
-    # 1) 利润表 income
-    income_raw_all = []
     for y in years:
-        raw = tushare_post("income", {"ts_code": f"{ctx.ticker}.SH" if ctx.ticker.startswith("6") else f"{ctx.ticker}.SZ",
-                                      "period": f"{y}1231"}, fields="")
-        income_raw_all.append({"year": y, "resp": raw})
+        resp = await tushare_post(
+            "income",
+            {"ts_code": ts_code, "period": f"{y}1231"},
+            fields="",  # 你可以后续收紧 fields
+        )
+        income_raw_all.append({"year": y, "resp": resp})
 
+    # ✅source 归类：market_data（你也可以叫 financial_data，但要全系统统一）
     src_income = build_source(
         run_id=ctx.run_id,
-        stype="financial_data",
+        source_type="market_data",
         provider="tushare",
-        url=f"https://api.tushare.pro?api_name=income&ts_code={ctx.ticker}",
-        title=f"{ctx.ticker} 利润表（Tushare）",
-        raw={"api": "income", "years": years, "data": income_raw_all},
+        url=f"https://api.tushare.pro?api_name=income&ts_code={ts_code}",
+        title=f"{ts_code} 利润表（Tushare income）",
+        raw={"provider": "tushare", "api": "income", "ts_code": ts_code, "years": years, "data": income_raw_all},
         published_at=None,
-        quote="结构化财务接口返回（可审计 raw）。"
+        quote="结构化财务接口返回（raw 可审计）。",
     )
     pack.sources.append(src_income)
 
-    # 将 income 的关键字段映射为 facts（注意：tushare data 是 fields + items）
-    # 为了不“编造”，只有在拿到可解析数据时才写 facts
+    # facts 映射（只在可解析时写，避免“编造”）
     for item in income_raw_all:
         y = item["year"]
-        resp = item["resp"]
+        resp = item["resp"] or {}
         if resp.get("code") != 0 or not resp.get("data"):
-            pack.warnings.append(f"income {y} 拉取失败或无数据：{resp.get('msg')}")
+            pack.warnings.append(f"income FY{y} 拉取失败或无数据：{resp.get('msg')}")
             continue
-        data = resp["data"]
-        fields = data.get("fields", [])
-        items = data.get("items", [])
+
+        data = resp.get("data") or {}
+        fields = data.get("fields") or []
+        items = data.get("items") or []
         if not fields or not items:
-            pack.warnings.append(f"income {y} 返回空 fields/items")
+            pack.warnings.append(f"income FY{y} 返回空 fields/items")
             continue
-        row = dict(zip(fields, items[0]))  # period=年末通常一条
-        # 你可以按需要扩展更多字段
+
+        # 有时会返回多行，取第一行（年末口径通常一行）
+        row = dict(zip(fields, items[0]))
+
+        # ✅字段名以 tushare 实际返回为准；拿不到就不写
         mapping = {
             "revenue": row.get("revenue"),
             "net_profit": row.get("n_income"),
             "net_profit_parent": row.get("n_income_attr_p"),
         }
+
+        # 给你一个“自检提示”：第一次跑你就知道字段是否存在
+        if y == years[-1]:
+            pack.warnings.append(f"income fields sample: {fields[:30]}")
+
         for metric, val in mapping.items():
             if val is None:
                 continue
@@ -209,57 +259,42 @@ async def collect_financials(ctx: RunContext) -> EvidencePack:
                 v = float(val)
             except Exception:
                 continue
-            pack.facts.append(FactRow(
-                run_id=ctx.run_id,
-                entity_kind="company",
-                entity_ticker=ctx.ticker,
-                entity_name=ctx.name,
-                metric=metric,
-                value=v,
-                period=f"FY{y}",
-                unit="CNY",
-                currency="CNY",
-                basis="consolidated",
-                asof_date=date(y, 12, 31),
-                source_id=src_income.source_id
-            ))
 
-    # 2) 现金流 cashflow（示例同理）
-    # 你可以照抄 income 的模式再做 cashflow / balancesheet / fina_indicator
+            pack.facts.append(
+                FactRow(
+                    run_id=ctx.run_id,
+                    entity_kind="company",
+                    entity_ticker=ctx.ticker,  # 保留原 ticker（你的系统内部主键）
+                    entity_name=ctx.name,
+                    metric=metric,
+                    value=v,
+                    period=f"FY{y}",
+                    unit="cny",       # ✅unit != currency
+                    currency="CNY",
+                    basis="consolidated",
+                    asof_date=date(y, 12, 31),
+                    source_id=src_income.source_id,
+                )
+            )
 
     return pack
 
 async def collect_valuation(ctx: RunContext) -> EvidencePack:
-    """
-    估值：优先做“当前PE/PB/PS + 10y分位”（数据源你可选：理杏仁 / 自算 / 其他）
-    未配置就返回 warnings，不输出假数据。
-    """
     pack = EvidencePack(run_id=ctx.run_id, ticker=ctx.ticker, asof=ctx.asof)
-    # 暂不强绑某一家，以免你没 token 就全是假
     pack.warnings.append("valuation 尚未接入真实数据源：未输出任何估值 facts。")
     return pack
 
 async def collect_filings(ctx: RunContext) -> EvidencePack:
-    """
-    公告/年报：建议落到 sources（annual_report / announcement）
-    这里先不写具体抓取（不同站点授权/反爬差异大），但接口结构已对齐。
-    """
     pack = EvidencePack(run_id=ctx.run_id, ticker=ctx.ticker, asof=ctx.asof)
     pack.warnings.append("filings 尚未接入公告/年报来源：未输出 sources。")
     return pack
 
 async def collect_news(ctx: RunContext) -> EvidencePack:
-    """
-    新闻：必须落 sources(type=news)，带 url/published_at/raw(元数据)
-    """
     pack = EvidencePack(run_id=ctx.run_id, ticker=ctx.ticker, asof=ctx.asof)
     pack.warnings.append("news 尚未接入新闻来源：未输出 sources。")
     return pack
 
 async def collect_peers(ctx: RunContext) -> EvidencePack:
-    """
-    同行：建议按行业分类/指数成分生成 peers 表
-    """
     pack = EvidencePack(run_id=ctx.run_id, ticker=ctx.ticker, asof=ctx.asof)
     pack.warnings.append("peers 尚未接入行业/成分股来源：未输出 peers。")
     return pack
@@ -274,9 +309,10 @@ COLLECTOR_MAP = {
 
 def merge_packs(packs: List[EvidencePack]) -> EvidencePack:
     out = packs[0]
+
     # sources 去重（按 source_id）
     seen_sid = set()
-    merged_sources = []
+    merged_sources: List[SourceRow] = []
     for p in packs:
         for s in p.sources:
             if s.source_id in seen_sid:
@@ -285,19 +321,19 @@ def merge_packs(packs: List[EvidencePack]) -> EvidencePack:
             merged_sources.append(s)
     out.sources = merged_sources
 
-    # facts（可再做更强去重：entity+metric+period+basis）
+    # facts 合并（进一步去重交给 DB 唯一索引更稳）
     out.facts = [f for p in packs for f in p.facts]
 
     # peers 去重
     seen_peer = set()
-    peers = []
+    merged_peers: List[PeerRow] = []
     for p in packs:
         for pe in p.peers:
             if pe.peer_ticker in seen_peer:
                 continue
             seen_peer.add(pe.peer_ticker)
-            peers.append(pe)
-    out.peers = peers
+            merged_peers.append(pe)
+    out.peers = merged_peers
 
     out.warnings = [w for p in packs for w in p.warnings]
     return out
@@ -305,6 +341,10 @@ def merge_packs(packs: List[EvidencePack]) -> EvidencePack:
 @app.post("/collect/evidence-pack", response_model=EvidencePack)
 async def collect_evidence(req: CollectRequest):
     ctx = req.run_context
+
+    if not ctx.run_id or not ctx.ticker:
+        raise HTTPException(status_code=400, detail="run_context.run_id 和 run_context.ticker 必填")
+
     packs: List[EvidencePack] = []
     for c in req.collectors:
         fn = COLLECTOR_MAP.get(c)
@@ -317,15 +357,19 @@ async def collect_evidence(req: CollectRequest):
 
     out = merge_packs(packs)
 
-    # 真实性护栏 1：facts 的 source_id 必须在 sources 里，否则打 warning（建议 n8n 直接拒绝入库 facts）
+    # 真实性护栏 1：facts.source_id 必须在 sources 里
     source_ids = {s.source_id for s in out.sources}
     bad_facts = [f for f in out.facts if f.source_id not in source_ids]
     if bad_facts:
-        out.warnings.append(f"{len(bad_facts)} 条 facts 缺失 source_id 对应 sources：建议拒绝写入 normalized_facts。")
+        out.warnings.append(
+            f"{len(bad_facts)} 条 facts 缺失 source_id 对应 sources：建议 n8n 拒绝写入 normalized_facts。"
+        )
 
     # 真实性护栏 2：sources 必须有 url_hash/content_hash
     bad_src = [s for s in out.sources if not s.url_hash or not s.content_hash]
     if bad_src:
-        out.warnings.append(f"{len(bad_src)} 条 sources 缺少 hash 字段：建议拒绝写入 sources。")
+        out.warnings.append(
+            f"{len(bad_src)} 条 sources 缺少 hash 字段：建议 n8n 拒绝写入 sources。"
+        )
 
     return out
