@@ -3,24 +3,41 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 from typing import List, Literal, Optional, Dict, Any, Tuple
 from datetime import datetime, date, timedelta
-import hashlib, json, os
+import hashlib, json, os, re
 import httpx
+from xml.etree import ElementTree as ET
 
 # =========================================================
 # Config (Zeabur Variables)
 # =========================================================
 TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "").strip()
-LIXINGER_TOKEN = os.getenv("LIXINGER_TOKEN", "").strip()  # 预留
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30"))
 
-CNINFO_USER_AGENT = os.getenv(
-    "CNINFO_USER_AGENT",
+# 理杏仁：你即使先不填 token，也先把配置位留好
+LIXINGER_TOKEN = os.getenv("LIXINGER_TOKEN", "").strip()
+LIXINGER_BASE_URL = os.getenv("LIXINGER_BASE_URL", "https://www.lixinger.com/open/api").strip()
+LIXINGER_TIMEOUT = float(os.getenv("LIXINGER_TIMEOUT", "30"))
+
+# 通用 HTTP
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30"))
+HTTP_UA = os.getenv(
+    "HTTP_USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari/537.36",
 ).strip()
-CNINFO_COOKIE = os.getenv("CNINFO_COOKIE", "").strip()  # 可选：遇到风控再配
 
-RSS_FEEDS = os.getenv("RSS_FEEDS", "").strip()  # 可选：逗号分隔
+# CNINFO（巨潮）
+CNINFO_USER_AGENT = os.getenv("CNINFO_USER_AGENT", HTTP_UA).strip()
+CNINFO_COOKIE = os.getenv("CNINFO_COOKIE", "").strip()  # 可选：遇到风控再配（不保证永远有效）
+CNINFO_PAGE_SIZE = int(os.getenv("CNINFO_PAGE_SIZE", "30"))
+CNINFO_MAX_PAGES = int(os.getenv("CNINFO_MAX_PAGES", "2"))  # 最多翻页数（防止太多）
+
+# RSS（逗号分隔）
+RSS_FEEDS = os.getenv("RSS_FEEDS", "").strip()
+RSS_MAX_ITEMS = int(os.getenv("RSS_MAX_ITEMS", "30"))
+
+# GDELT
 GDELT_MAXRECORDS = int(os.getenv("GDELT_MAXRECORDS", "50"))
+GDELT_TIMESPAN_DAYS = int(os.getenv("GDELT_TIMESPAN_DAYS", "30"))
+GDELT_LANG = os.getenv("GDELT_LANG", "").strip()  # 可选：如 "Chinese" / "English"（按 GDELT 参数约定）
 
 CollectorName = Literal["financials", "valuation", "filings", "news", "peers"]
 
@@ -37,6 +54,12 @@ def safe_json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str)
 
 def normalize_ts_code(ticker: str) -> str:
+    """
+    支持：
+    - 600519 / 600519.SH
+    - 000001 / 300xxx
+    - 北交所 8xxxx / 4xxxx -> .BJ
+    """
     t = (ticker or "").strip().upper()
     if not t:
         return t
@@ -53,18 +76,51 @@ def normalize_ts_code(ticker: str) -> str:
 def make_source_id(run_id: str, provider: str, stype: str, url_hash: str) -> str:
     return f"src_{provider}_{stype}__{run_id}__{url_hash[:16]}"
 
-async def http_get_json(url: str, params: Dict[str, Any], headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        r = await client.get(url, params=params, headers=headers)
+def strip_html(s: str) -> str:
+    if not s:
+        return ""
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def parse_date_yyyymmdd(s: str) -> Optional[date]:
+    if not s:
+        return None
+    s = s.strip()
+    try:
+        if len(s) == 8 and s.isdigit():
+            return date(int(s[0:4]), int(s[4:6]), int(s[6:8]))
+    except Exception:
+        return None
+    return None
+
+async def http_get_text(url: str, params: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None) -> str:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=headers) as client:
+        r = await client.get(url, params=params)
+        r.raise_for_status()
+        return r.text
+
+async def http_get_json(url: str, params: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=headers) as client:
+        r = await client.get(url, params=params)
         r.raise_for_status()
         return r.json()
 
 async def http_post_form(url: str, data: Dict[str, Any], headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        r = await client.post(url, data=data, headers=headers)
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=headers) as client:
+        r = await client.post(url, data=data)
         r.raise_for_status()
         return r.json()
 
+async def http_post_json(url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None, timeout: Optional[float] = None) -> Dict[str, Any]:
+    async with httpx.AsyncClient(timeout=(timeout or HTTP_TIMEOUT), headers=headers) as client:
+        r = await client.post(url, json=payload)
+        r.raise_for_status()
+        return r.json()
+
+# =========================================================
+# Tushare
+# =========================================================
 async def tushare_post(api_name: str, params: Dict[str, Any], fields: str = "") -> Dict[str, Any]:
     if not TUSHARE_TOKEN:
         return {"code": -1, "msg": "TUSHARE_TOKEN missing", "data": None}
@@ -77,10 +133,9 @@ async def tushare_post(api_name: str, params: Dict[str, Any], fields: str = "") 
         return r.json()
 
 def tushare_first_row(resp: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], List[str], str]:
-    """
-    返回：(row_dict or None, fields, err_msg)
-    """
-    if not resp or resp.get("code") != 0:
+    if not resp:
+        return None, [], "empty resp"
+    if resp.get("code") != 0:
         return None, [], resp.get("msg", "tushare error")
     data = resp.get("data") or {}
     fields = data.get("fields") or []
@@ -88,6 +143,98 @@ def tushare_first_row(resp: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], L
     if not fields or not items:
         return None, fields, "empty fields/items"
     return dict(zip(fields, items[0])), fields, ""
+
+# =========================================================
+# Lixinger (理杏仁) —— 不硬编码具体接口，做“可配置的请求位”
+# 你后面只要补齐 env：LIXINGER_ENDPOINT_xxx 就能跑
+# =========================================================
+LIXINGER_ENDPOINT_CURRENT = os.getenv("LIXINGER_ENDPOINT_CURRENT", "").strip()
+LIXINGER_ENDPOINT_PERCENTILE = os.getenv("LIXINGER_ENDPOINT_PERCENTILE", "").strip()
+
+async def lixinger_post(endpoint_path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    理杏仁 OpenAPI：不同账号/版本的 endpoint 可能不一样，所以做成 env 可配。
+    - LIXINGER_BASE_URL: https://www.lixinger.com/open/api
+    - endpoint_path: 例如 /stock/valuation 或你实际拿到的路径
+    """
+    if not LIXINGER_TOKEN:
+        return {"ok": False, "msg": "LIXINGER_TOKEN missing", "data": None}
+    if not endpoint_path:
+        return {"ok": False, "msg": "LIXINGER endpoint missing", "data": None}
+
+    url = LIXINGER_BASE_URL.rstrip("/") + "/" + endpoint_path.lstrip("/")
+    headers = {
+        "User-Agent": HTTP_UA,
+        "Content-Type": "application/json",
+        # 常见做法：token 放 header 或 payload，具体以你账号文档为准
+        "Authorization": f"Bearer {LIXINGER_TOKEN}",
+    }
+    try:
+        return await http_post_json(url, payload=payload, headers=headers, timeout=LIXINGER_TIMEOUT)
+    except Exception as e:
+        return {"ok": False, "msg": f"lixinger request failed: {e}", "data": None}
+
+# =========================================================
+# RSS Parser (RSS/Atom 简易解析)
+# =========================================================
+def parse_rss_or_atom(xml_text: str) -> List[Dict[str, Any]]:
+    """
+    返回 items: [{title, link, published_at(optional), summary(optional)}]
+    """
+    out: List[Dict[str, Any]] = []
+    if not xml_text:
+        return out
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return out
+
+    # RSS: <rss><channel><item>...
+    channel = root.find("channel")
+    if channel is not None:
+        for item in channel.findall("item"):
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            pub = (item.findtext("pubDate") or "").strip()
+            desc = (item.findtext("description") or "").strip()
+            out.append({"title": strip_html(title), "link": link, "pub_raw": pub, "summary": strip_html(desc)})
+        return out
+
+    # Atom: <feed><entry>...
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
+    if root.tag.endswith("feed"):
+        for entry in root.findall("atom:entry", ns) + root.findall("entry"):
+            title = (entry.findtext("atom:title", default="", namespaces=ns) or entry.findtext("title") or "").strip()
+            link = ""
+            link_el = entry.find("atom:link", ns) or entry.find("link")
+            if link_el is not None:
+                link = (link_el.attrib.get("href") or "").strip()
+            updated = (entry.findtext("atom:updated", default="", namespaces=ns) or entry.findtext("updated") or "").strip()
+            summary = (entry.findtext("atom:summary", default="", namespaces=ns) or entry.findtext("summary") or "").strip()
+            out.append({"title": strip_html(title), "link": link, "pub_raw": updated, "summary": strip_html(summary)})
+        return out
+
+    return out
+
+def try_parse_pub_date(pub_raw: str) -> Optional[date]:
+    """
+    轻量解析：尽量从字符串中提取 YYYY-MM-DD 或 YYYY/MM/DD 或 YYYYMMDD
+    """
+    if not pub_raw:
+        return None
+    pub_raw = pub_raw.strip()
+    # YYYY-MM-DD / YYYY/MM/DD
+    m = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", pub_raw)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except Exception:
+            return None
+    # YYYYMMDD
+    m2 = re.search(r"(\d{8})", pub_raw)
+    if m2:
+        return parse_date_yyyymmdd(m2.group(1))
+    return None
 
 # =========================================================
 # Models (align DB)
@@ -105,14 +252,25 @@ class RunContext(BaseModel):
             return None
         return v
 
+class CollectOptions(BaseModel):
+    years: Optional[List[int]] = None                 # 覆盖财务年份
+    gdelt_days: Optional[int] = None                  # 覆盖 GDELT timespan
+    gdelt_maxrecords: Optional[int] = None            # 覆盖 GDELT maxrecords
+    rss_feeds: Optional[List[str]] = None             # 覆盖 RSS 列表
+    rss_max_items: Optional[int] = None               # 覆盖 RSS 最大条数
+    cninfo_days: Optional[int] = None                 # 覆盖 CNINFO 日期范围（默认 365）
+    cninfo_page_size: Optional[int] = None            # 覆盖 CNINFO pageSize
+    cninfo_max_pages: Optional[int] = None            # 覆盖 CNINFO 翻页
+
 class CollectRequest(BaseModel):
     run_context: RunContext
     collectors: List[CollectorName] = Field(default_factory=lambda: ["financials", "valuation", "filings", "news", "peers"])
+    options: Optional[CollectOptions] = None
 
 class SourceRow(BaseModel):
     source_id: str
     run_id: str
-    type: str
+    type: str  # annual_report | announcement | news | policy | industry_report | market_data | valuation_data ...
     title: Optional[str] = None
     url: str
     url_hash: str
@@ -189,21 +347,20 @@ def build_source(
 # =========================================================
 # Collectors
 # =========================================================
-async def collect_financials(ctx: RunContext) -> EvidencePack:
+async def collect_financials(ctx: RunContext, opt: Optional[CollectOptions]) -> EvidencePack:
     """
-    目标：三表 + 财务指标 + 当前估值快照（daily_basic）
-    全部可审计：raw 存 sources.raw，facts 从 raw 映射（拿不到就不写）
+    三表 + 财务指标（Tushare）
+    不具备权限就 warnings，不编造。
     """
     pack = EvidencePack(run_id=ctx.run_id, ticker=ctx.ticker, asof=ctx.asof)
-    ts_code = normalize_ts_code(ctx.ticker)
-
     if not TUSHARE_TOKEN:
         pack.warnings.append("TUSHARE_TOKEN 未配置：financials 未抓取。")
         return pack
 
-    years = [2021, 2022, 2023]
+    ts_code = normalize_ts_code(ctx.ticker)
+    years = (opt.years if opt and opt.years else [2021, 2022, 2023])
 
-    # ---- income ----
+    # income
     income_raw = []
     for y in years:
         resp = await tushare_post("income", {"ts_code": ts_code, "period": f"{y}1231"})
@@ -245,7 +402,7 @@ async def collect_financials(ctx: RunContext) -> EvidencePack:
                 source_id=src_income.source_id
             ))
 
-    # ---- balancesheet ----
+    # balancesheet
     bs_raw = []
     for y in years:
         resp = await tushare_post("balancesheet", {"ts_code": ts_code, "period": f"{y}1231"})
@@ -291,7 +448,7 @@ async def collect_financials(ctx: RunContext) -> EvidencePack:
                 source_id=src_bs.source_id
             ))
 
-    # ---- cashflow ----
+    # cashflow
     cf_raw = []
     for y in years:
         resp = await tushare_post("cashflow", {"ts_code": ts_code, "period": f"{y}1231"})
@@ -317,7 +474,7 @@ async def collect_financials(ctx: RunContext) -> EvidencePack:
             "cfo": row.get("n_cashflow_act"),
             "cfi": row.get("n_cashflow_inv_act"),
             "cff": row.get("n_cashflow_fin_act"),
-            "capex": row.get("c_pay_acq_const_fiolta"),  # 常用 capex 近似
+            "capex": row.get("c_pay_acq_const_fiolta"),
         }
         for metric, val in mapping.items():
             if val is None:
@@ -333,7 +490,7 @@ async def collect_financials(ctx: RunContext) -> EvidencePack:
                 source_id=src_cf.source_id
             ))
 
-    # ---- fina_indicator（比率类）----
+    # fina_indicator
     fi_raw = []
     for y in years:
         resp = await tushare_post("fina_indicator", {"ts_code": ts_code, "period": f"{y}1231"})
@@ -349,6 +506,7 @@ async def collect_financials(ctx: RunContext) -> EvidencePack:
     )
     pack.sources.append(src_fi)
 
+    pct_metrics = {"roe", "roa", "gross_margin", "net_margin"}
     for item in fi_raw:
         y = item["year"]
         row, _, err = tushare_first_row(item["resp"])
@@ -375,36 +533,146 @@ async def collect_financials(ctx: RunContext) -> EvidencePack:
             pack.facts.append(FactRow(
                 run_id=ctx.run_id, entity_kind="company", entity_ticker=ctx.ticker, entity_name=ctx.name,
                 metric=metric, value=v, period=f"FY{y}",
-                unit="pct" if metric in ["roe","roa","gross_margin","net_margin"] else "ratio",
+                unit="pct" if metric in pct_metrics else "ratio",
                 currency=None, basis="consolidated", asof_date=date(y,12,31),
                 source_id=src_fi.source_id
             ))
 
     return pack
 
-async def collect_valuation(ctx: RunContext) -> EvidencePack:
+async def collect_valuation(ctx: RunContext, opt: Optional[CollectOptions]) -> EvidencePack:
     """
-    MVP：先做当前估值（PE/PB/PS）——用 Tushare daily_basic（可能也有权限门槛）
-    历史分位后续再接：理杏仁 / 自算
+    估值优先级：
+    1) 理杏仁（如果配置了 token + endpoint）
+    2) Tushare daily_basic（可能也有权限门槛）
+    3) 都不行 -> warnings（不编造）
     """
     pack = EvidencePack(run_id=ctx.run_id, ticker=ctx.ticker, asof=ctx.asof)
+
+    # ---------- 1) Lixinger ----------
+    if LIXINGER_TOKEN and (LIXINGER_ENDPOINT_CURRENT or LIXINGER_ENDPOINT_PERCENTILE):
+        payload = {
+            # 你后面按你账号文档来改字段：这里只提供一个“可运行的占位 payload”
+            "ticker": ctx.ticker,
+            "name": ctx.name,
+            "asof": (ctx.asof.isoformat() if ctx.asof else None),
+        }
+
+        if LIXINGER_ENDPOINT_CURRENT:
+            resp = await lixinger_post(LIXINGER_ENDPOINT_CURRENT, payload)
+            src = build_source(
+                run_id=ctx.run_id,
+                source_type="valuation_data",
+                provider="lixinger",
+                url=LIXINGER_BASE_URL.rstrip("/") + "/" + LIXINGER_ENDPOINT_CURRENT.lstrip("/"),
+                title=f"{ctx.ticker} 当前估值（理杏仁）",
+                raw={"endpoint": LIXINGER_ENDPOINT_CURRENT, "payload": payload, "resp": resp},
+                quote="估值来自理杏仁 OpenAPI（raw 可审计）。",
+            )
+            pack.sources.append(src)
+
+            # 你需要把这里的字段映射改成你实际响应结构
+            # 为避免编造：只有找到数值才写 facts
+            def pick_num(d: Dict[str, Any], keys: List[str]) -> Optional[float]:
+                cur = d
+                for k in keys:
+                    if not isinstance(cur, dict) or k not in cur:
+                        return None
+                    cur = cur[k]
+                try:
+                    return float(cur)
+                except Exception:
+                    return None
+
+            pe = pick_num(resp, ["data", "pe"]) or pick_num(resp, ["data", "pe_ttm"])
+            pb = pick_num(resp, ["data", "pb"])
+            ps = pick_num(resp, ["data", "ps"])
+            mv = pick_num(resp, ["data", "total_mv"]) or pick_num(resp, ["data", "market_cap"])
+
+            mapping = {"pe_current": pe, "pb_current": pb, "ps_current": ps, "total_mv": mv}
+            for metric, v in mapping.items():
+                if v is None:
+                    continue
+                pack.facts.append(FactRow(
+                    run_id=ctx.run_id, entity_kind="company", entity_ticker=ctx.ticker, entity_name=ctx.name,
+                    metric=metric, value=v, period="current",
+                    unit="times" if metric.endswith("_current") else "cny",
+                    currency="CNY" if metric == "total_mv" else None,
+                    basis="snapshot", asof_date=ctx.asof,
+                    source_id=src.source_id
+                ))
+
+        if LIXINGER_ENDPOINT_PERCENTILE:
+            resp = await lixinger_post(LIXINGER_ENDPOINT_PERCENTILE, payload)
+            src = build_source(
+                run_id=ctx.run_id,
+                source_type="valuation_data",
+                provider="lixinger",
+                url=LIXINGER_BASE_URL.rstrip("/") + "/" + LIXINGER_ENDPOINT_PERCENTILE.lstrip("/"),
+                title=f"{ctx.ticker} 估值历史分位（理杏仁）",
+                raw={"endpoint": LIXINGER_ENDPOINT_PERCENTILE, "payload": payload, "resp": resp},
+                quote="历史分位来自理杏仁 OpenAPI（raw 可审计）。",
+            )
+            pack.sources.append(src)
+
+            # 同理：按你实际结构修改映射
+            def pick_num(d: Dict[str, Any], keys: List[str]) -> Optional[float]:
+                cur = d
+                for k in keys:
+                    if not isinstance(cur, dict) or k not in cur:
+                        return None
+                    cur = cur[k]
+                try:
+                    return float(cur)
+                except Exception:
+                    return None
+
+            pe_p = pick_num(resp, ["data", "pe_10y_percentile"]) or pick_num(resp, ["data", "pe_percentile_10y"])
+            pb_p = pick_num(resp, ["data", "pb_10y_percentile"]) or pick_num(resp, ["data", "pb_percentile_10y"])
+            ps_p = pick_num(resp, ["data", "ps_10y_percentile"]) or pick_num(resp, ["data", "ps_percentile_10y"])
+
+            mapping = {
+                "pe_percentile_10y": pe_p,
+                "pb_percentile_10y": pb_p,
+                "ps_percentile_10y": ps_p,
+            }
+            for metric, v in mapping.items():
+                if v is None:
+                    continue
+                pack.facts.append(FactRow(
+                    run_id=ctx.run_id, entity_kind="company", entity_ticker=ctx.ticker, entity_name=ctx.name,
+                    metric=metric, value=v, period="10y_percentile",
+                    unit="pct", currency=None, basis="history_percentile",
+                    asof_date=ctx.asof,
+                    source_id=src.source_id
+                ))
+
+        # 如果 lixinger 配了但没解析到任何 facts，也给 warning，避免你误以为“抓到了”
+        if not pack.facts:
+            pack.warnings.append("valuation：理杏仁已请求但未解析出可用字段（需要按实际响应结构改映射）。")
+
+        return pack
+
+    # ---------- 2) fallback to Tushare daily_basic ----------
     if not TUSHARE_TOKEN:
-        pack.warnings.append("TUSHARE_TOKEN 未配置：valuation 未抓取。")
+        pack.warnings.append("valuation：既无 LIXINGER_TOKEN，也无 TUSHARE_TOKEN，未抓取。")
         return pack
 
     ts_code = normalize_ts_code(ctx.ticker)
-    today = (ctx.asof or date.today()).strftime("%Y%m%d")
+    asof = ctx.asof or date.today()
+    trade_date = asof.strftime("%Y%m%d")
 
-    resp = await tushare_post("daily_basic", {"ts_code": ts_code, "trade_date": today})
+    resp = await tushare_post("daily_basic", {"ts_code": ts_code, "trade_date": trade_date})
     row, fields, err = tushare_first_row(resp)
+
     src = build_source(
         run_id=ctx.run_id,
         source_type="valuation_data",
         provider="tushare",
-        url=f"https://api.tushare.pro?api_name=daily_basic&ts_code={ts_code}&trade_date={today}",
+        url=f"https://api.tushare.pro?api_name=daily_basic&ts_code={ts_code}&trade_date={trade_date}",
         title=f"{ts_code} 当前估值快照（Tushare daily_basic）",
-        raw={"api":"daily_basic","ts_code":ts_code,"trade_date":today,"resp":resp,"fields_sample":fields[:50]},
-        quote="结构化接口返回（raw 可审计）。"
+        raw={"api": "daily_basic", "ts_code": ts_code, "trade_date": trade_date, "resp": resp, "fields_sample": fields[:60]},
+        quote="结构化接口返回（raw 可审计）。",
     )
     pack.sources.append(src)
 
@@ -430,136 +698,209 @@ async def collect_valuation(ctx: RunContext) -> EvidencePack:
             metric=metric, value=v, period="current",
             unit="times" if metric.endswith("_current") else "cny",
             currency="CNY" if metric == "total_mv" else None,
-            basis="snapshot", asof_date=ctx.asof, source_id=src.source_id
+            basis="snapshot",
+            asof_date=asof,
+            source_id=src.source_id
         ))
+
     return pack
 
-async def collect_news(ctx: RunContext) -> EvidencePack:
+async def collect_news(ctx: RunContext, opt: Optional[CollectOptions]) -> EvidencePack:
     """
-    用 GDELT DOC API：要求输出必须有 url + published_at
-    官方文档/示例见 GDELT 博客（DOC API）: api.gdeltproject.org/api/v2/doc/doc ... :contentReference[oaicite:4]{index=4}
+    新闻 = GDELT + RSS（都可选）
+    - GDELT 不需要 key
+    - RSS 需要你在 env 或 options 里提供 feed 列表
     """
     pack = EvidencePack(run_id=ctx.run_id, ticker=ctx.ticker, asof=ctx.asof)
+    keyword = (ctx.name or "").strip() or ctx.ticker
 
-    # 查询关键词：公司名优先，其次 ticker
-    q = (ctx.name or "").strip() or ctx.ticker
-    if not q:
-        pack.warnings.append("news：缺少 name/ticker 作为关键词")
-        return pack
+    # -------- GDELT --------
+    gdelt_days = (opt.gdelt_days if opt and opt.gdelt_days is not None else GDELT_TIMESPAN_DAYS)
+    gdelt_max = (opt.gdelt_maxrecords if opt and opt.gdelt_maxrecords is not None else GDELT_MAXRECORDS)
 
-    # 最近 30 天
-    params = {
-        "query": f"\"{q}\"",
-        "mode": "artlist",
-        "format": "json",
-        "sort": "datedesc",
-        "maxrecords": str(GDELT_MAXRECORDS),
-        "timespan": "30d",
-    }
+    if keyword:
+        params = {
+            "query": f"\"{keyword}\"",
+            "mode": "artlist",
+            "format": "json",
+            "sort": "datedesc",
+            "maxrecords": str(gdelt_max),
+            "timespan": f"{int(gdelt_days)}d",
+        }
+        if GDELT_LANG:
+            params["format"] = "json"  # keep
+            # 注意：GDELT 的语言参数不同模式可能不同，这里先不强加，避免误传导致 400
 
-    try:
-        data = await http_get_json("https://api.gdeltproject.org/api/v2/doc/doc", params=params)
-    except Exception as e:
-        pack.warnings.append(f"GDELT 请求失败：{e}")
-        return pack
+        try:
+            data = await http_get_json("https://api.gdeltproject.org/api/v2/doc/doc", params=params, headers={"User-Agent": HTTP_UA})
+            articles = data.get("articles") or []
+        except Exception as e:
+            pack.warnings.append(f"GDELT 请求失败：{e}")
+            articles = []
 
-    articles = data.get("articles") or []
-    # 用一个 source 汇总 raw（审计用）
-    src_meta = build_source(
-        run_id=ctx.run_id,
-        source_type="news",
-        provider="gdelt",
-        url=f"https://api.gdeltproject.org/api/v2/doc/doc?query={q}",
-        title=f"{q} 新闻候选池（GDELT DOC）",
-        raw={"query": params, "count": len(articles), "resp_sample": articles[:3]},
-        quote="新闻元数据来自 GDELT DOC API（URL 可追溯）。",
-    )
-    pack.sources.append(src_meta)
-
-    # 每篇文章也单独落 sources（推荐，便于去重与引用）
-    for a in articles:
-        url = a.get("url")
-        title = a.get("title") or "news"
-        seendate = a.get("seendate")  # e.g. 20240101123000
-        pub = None
-        if seendate and len(seendate) >= 8:
-            try:
-                pub = date(int(seendate[0:4]), int(seendate[4:6]), int(seendate[6:8]))
-            except Exception:
-                pub = None
-        if not url:
-            continue
-        s = build_source(
+        src_meta = build_source(
             run_id=ctx.run_id,
             source_type="news",
             provider="gdelt",
-            url=url,
-            title=title,
-            raw={"gdelt": a},
-            published_at=pub,
-            quote=None,
+            url="https://api.gdeltproject.org/api/v2/doc/doc",
+            title=f"{keyword} 新闻候选池（GDELT）",
+            raw={"params": params, "count": len(articles), "resp_sample": (articles[:3] if articles else [])},
+            quote="新闻元数据来自 GDELT DOC API（URL 可追溯）。",
         )
-        pack.sources.append(s)
+        pack.sources.append(src_meta)
+
+        for a in articles:
+            url = a.get("url")
+            title = a.get("title") or "news"
+            seendate = a.get("seendate")  # 20240101123000
+            pub = parse_date_yyyymmdd(seendate[0:8]) if seendate and len(seendate) >= 8 else None
+            if not url:
+                continue
+            s = build_source(
+                run_id=ctx.run_id,
+                source_type="news",
+                provider="gdelt",
+                url=url,
+                title=title,
+                raw={"gdelt": a},
+                published_at=pub,
+                quote=None,
+            )
+            pack.sources.append(s)
+
+    # -------- RSS --------
+    feeds: List[str] = []
+    if opt and opt.rss_feeds:
+        feeds = [x.strip() for x in opt.rss_feeds if x and x.strip()]
+    elif RSS_FEEDS:
+        feeds = [x.strip() for x in RSS_FEEDS.split(",") if x.strip()]
+
+    rss_max_items = (opt.rss_max_items if opt and opt.rss_max_items is not None else RSS_MAX_ITEMS)
+
+    if feeds:
+        rss_src = build_source(
+            run_id=ctx.run_id,
+            source_type="news",
+            provider="rss",
+            url=",".join(feeds[:5]) + ("..." if len(feeds) > 5 else ""),
+            title=f"{keyword} RSS 聚合（{len(feeds)} feeds）",
+            raw={"feeds": feeds, "max_items": rss_max_items},
+            quote="新闻元数据来自 RSS/Atom（URL 可追溯）。",
+        )
+        pack.sources.append(rss_src)
+
+        seen_links = set()
+        total_added = 0
+        for feed_url in feeds:
+            if total_added >= rss_max_items:
+                break
+            try:
+                xml_text = await http_get_text(feed_url, headers={"User-Agent": HTTP_UA})
+                items = parse_rss_or_atom(xml_text)
+            except Exception as e:
+                pack.warnings.append(f"RSS 拉取失败：{feed_url} -> {e}")
+                continue
+
+            for it in items:
+                if total_added >= rss_max_items:
+                    break
+                link = (it.get("link") or "").strip()
+                if not link or link in seen_links:
+                    continue
+                seen_links.add(link)
+                title = it.get("title") or "news"
+                pub = try_parse_pub_date(it.get("pub_raw") or "")
+                summary = it.get("summary") or None
+
+                s = build_source(
+                    run_id=ctx.run_id,
+                    source_type="news",
+                    provider="rss",
+                    url=link,
+                    title=title,
+                    raw={"feed": feed_url, "item": it},
+                    published_at=pub,
+                    quote=summary[:280] if summary else None,  # 只留短摘要，避免版权风险
+                )
+                pack.sources.append(s)
+                total_added += 1
+
+    if not keyword:
+        pack.warnings.append("news：缺少 name/ticker 作为关键词，GDELT 未查询。")
+    if not feeds and not RSS_FEEDS:
+        pack.warnings.append("news：未配置 RSS_FEEDS（可选），仅使用 GDELT（如可用）。")
 
     return pack
 
-async def collect_filings(ctx: RunContext) -> EvidencePack:
+async def collect_filings(ctx: RunContext, opt: Optional[CollectOptions]) -> EvidencePack:
     """
-    CNINFO 公告列表元数据（hisAnnouncement/query）
-    常见入口： https://www.cninfo.com.cn/new/hisAnnouncement/query  :contentReference[oaicite:5]{index=5}
-    注意：可能有风控/限流/验证码，失败就 warnings，不编造。
+    CNINFO 公告列表元数据：
+    - 可能遇到风控/验证码/限流 -> warnings，不造假
+    - 只抓“元数据 + PDF 链接”，quote 后续你再做 PDF 解析补
     """
     pack = EvidencePack(run_id=ctx.run_id, ticker=ctx.ticker, asof=ctx.asof)
 
-    # CNINFO 常用的是 “secCode”/“stock” 等参数体系，实际可能需要你微调
-    # MVP：先按代码模糊搜（跑通后再加 orgId 等精确字段）
     code = (ctx.ticker or "").strip()
     if not code:
         pack.warnings.append("filings：缺少 ticker")
         return pack
+
+    cninfo_days = (opt.cninfo_days if opt and opt.cninfo_days is not None else 365)
+    page_size = (opt.cninfo_page_size if opt and opt.cninfo_page_size is not None else CNINFO_PAGE_SIZE)
+    max_pages = (opt.cninfo_max_pages if opt and opt.cninfo_max_pages is not None else CNINFO_MAX_PAGES)
 
     url = "https://www.cninfo.com.cn/new/hisAnnouncement/query"
     headers = {
         "User-Agent": CNINFO_USER_AGENT,
         "Accept": "application/json, text/plain, */*",
         "Referer": "https://www.cninfo.com.cn/",
+        "Origin": "https://www.cninfo.com.cn",
     }
     if CNINFO_COOKIE:
         headers["Cookie"] = CNINFO_COOKIE
 
-    # 时间范围：最近 365 天
     end = (ctx.asof or date.today())
-    start = end - timedelta(days=365)
+    start = end - timedelta(days=int(cninfo_days))
     seDate = f"{start.strftime('%Y-%m-%d')}~{end.strftime('%Y-%m-%d')}"
 
-    form = {
-        "pageNum": "1",
-        "pageSize": "30",
-        "tabName": "fulltext",
-        "seDate": seDate,
-        "stock": code,
-    }
+    all_ann = []
+    last_error = None
 
-    try:
-        resp = await http_post_form(url, data=form, headers=headers)
-    except Exception as e:
-        pack.warnings.append(f"CNINFO 请求失败（可能风控/限流）：{e}")
+    for page in range(1, max_pages + 1):
+        form = {
+            "pageNum": str(page),
+            "pageSize": str(page_size),
+            "tabName": "fulltext",
+            "seDate": seDate,
+            # CNINFO 参数体系会变，这里先用 stock=code MVP 跑通
+            "stock": code,
+        }
+        try:
+            resp = await http_post_form(url, data=form, headers=headers)
+            ann = resp.get("announcements") or resp.get("data") or []
+            if not ann:
+                break
+            all_ann.extend(ann)
+        except Exception as e:
+            last_error = e
+            break
+
+    if last_error and not all_ann:
+        pack.warnings.append(f"CNINFO 请求失败（可能风控/限流/验证码）：{last_error}")
         return pack
 
-    ann = resp.get("announcements") or resp.get("data") or []
     src_meta = build_source(
         run_id=ctx.run_id,
         source_type="announcement",
         provider="cninfo",
         url=url,
         title=f"{code} 公告列表（CNINFO 元数据）",
-        raw={"form": form, "resp_sample": ann[:3]},
+        raw={"seDate": seDate, "page_size": page_size, "pages": max_pages, "count": len(all_ann), "sample": all_ann[:3]},
         quote="公告元数据来自 CNINFO 列表接口（URL 可追溯）。",
     )
     pack.sources.append(src_meta)
 
-    # 每条公告也落一条 sources（建议）
-    for x in ann:
+    for x in all_ann:
         title = x.get("announcementTitle") or x.get("title") or "announcement"
         adjunct = x.get("adjunctUrl") or x.get("url")
         pub_ms = x.get("announcementTime")  # ms timestamp 常见
@@ -569,6 +910,7 @@ async def collect_filings(ctx: RunContext) -> EvidencePack:
                 pub = datetime.utcfromtimestamp(pub_ms / 1000).date()
             except Exception:
                 pub = None
+
         if adjunct:
             if adjunct.startswith("http"):
                 pdf_url = adjunct
@@ -591,17 +933,15 @@ async def collect_filings(ctx: RunContext) -> EvidencePack:
 
     return pack
 
-async def collect_peers(ctx: RunContext) -> EvidencePack:
+async def collect_peers(ctx: RunContext, opt: Optional[CollectOptions]) -> EvidencePack:
     """
-    同行池：先用 stock_basic 的 industry 字段做一个 MVP 同行列表
-    注意：industry 口径各家不同，你后续可以换成 申万/中信分类
+    同行池：Tushare stock_basic industry 字段（MVP）
     """
     pack = EvidencePack(run_id=ctx.run_id, ticker=ctx.ticker, asof=ctx.asof)
     if not TUSHARE_TOKEN:
         pack.warnings.append("TUSHARE_TOKEN 未配置：peers 未抓取。")
         return pack
 
-    # 先拿全量 stock_basic（MVP 简单做，后续可缓存）
     resp = await tushare_post("stock_basic", {"exchange": "", "list_status": "L"}, fields="ts_code,name,industry")
     if resp.get("code") != 0:
         pack.warnings.append(f"stock_basic 失败/无权限：{resp.get('msg')}")
@@ -614,7 +954,6 @@ async def collect_peers(ctx: RunContext) -> EvidencePack:
         pack.warnings.append("stock_basic 返回空")
         return pack
 
-    # 找到当前公司行业
     my_ts = normalize_ts_code(ctx.ticker)
     my_ind = None
     for it in items:
@@ -626,7 +965,6 @@ async def collect_peers(ctx: RunContext) -> EvidencePack:
         pack.warnings.append("peers：无法从 stock_basic 找到该股或行业字段为空")
         return pack
 
-    # 同行业取前 20 家
     peers = []
     for it in items:
         row = dict(zip(fields, it))
@@ -635,13 +973,12 @@ async def collect_peers(ctx: RunContext) -> EvidencePack:
         if len(peers) >= 20:
             break
 
-    # 用一个 source 记录“同行池构建规则”
     src = build_source(
         run_id=ctx.run_id,
         source_type="industry_report",
         provider="tushare",
         url="https://api.tushare.pro?api_name=stock_basic",
-        title=f"{ctx.ticker} 同行池（同 industry={my_ind}）",
+        title=f"{ctx.ticker} 同行池（industry={my_ind}）",
         raw={"industry": my_ind, "peers_sample": peers[:5]},
         quote="同行池由 Tushare stock_basic industry 字段构建（MVP 规则）。"
     )
@@ -663,7 +1000,6 @@ COLLECTOR_MAP = {
 
 def merge_packs(packs: List[EvidencePack]) -> EvidencePack:
     out = packs[0]
-
     seen_sid = set()
     merged_sources = []
     for p in packs:
@@ -695,12 +1031,14 @@ async def collect_evidence(req: CollectRequest):
     if not ctx.run_id or not ctx.ticker:
         raise HTTPException(status_code=400, detail="run_context.run_id 和 run_context.ticker 必填")
 
+    opt = req.options
+
     packs: List[EvidencePack] = []
     for c in req.collectors:
         fn = COLLECTOR_MAP.get(c)
         if not fn:
             raise HTTPException(status_code=400, detail=f"Unknown collector: {c}")
-        packs.append(await fn(ctx))
+        packs.append(await fn(ctx, opt))
 
     out = merge_packs(packs)
 
